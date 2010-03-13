@@ -3,7 +3,7 @@
 ;; Copyright 2009, 2010 Kevin Ryde
 
 ;; Author: Kevin Ryde <user42@zip.com.au>
-;; Version: 4
+;; Version: 5
 ;; Keywords: data
 ;; EmacsWiki: SQLite
 ;; URL: http://user42.tuxfamily.org/sqlite-dump/index.html
@@ -55,12 +55,17 @@
 ;; Version 2 - add sqlite 2.x
 ;; Version 3 - undo defadvice on unload-feature
 ;; Version 4 - better write-region-post-annotation-function
+;; Version 5 - express dependency on 'advice
 
 ;;; Emacsen:
 
 ;; Designed for Emacs 21 up, works in XEmacs 21.
 
 ;;; Code:
+
+;; for `ad-find-advice' macro when running uncompiled
+;; (don't unload 'advice before our -unload-function)
+(require 'advice)
 
 ;;-----------------------------------------------------------------------------
 ;; xemacs incompatibilities
@@ -102,6 +107,9 @@ file is removed no matter what BODY does."
          (mapc 'delete-file
                (delete "." (delete ".." (directory-files tempdir)))))
        (delete-directory tempdir))))
+
+;; quieten byte compiler pre emacs23
+(defvar write-region-post-annotation-function)
 
 (defmacro sqlite-dump--without-post-kill (&rest body)
   "Evaluate BODY without post-annotation kill-buffer.
