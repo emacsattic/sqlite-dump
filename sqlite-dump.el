@@ -1,9 +1,9 @@
 ;;; sqlite-dump.el --- view dump of sqlite database file
 
-;; Copyright 2009, 2010 Kevin Ryde
+;; Copyright 2009, 2010, 2011 Kevin Ryde
 
 ;; Author: Kevin Ryde <user42@zip.com.au>
-;; Version: 5
+;; Version: 6
 ;; Keywords: data
 ;; EmacsWiki: SQLite
 ;; URL: http://user42.tuxfamily.org/sqlite-dump/index.html
@@ -23,11 +23,11 @@
 
 ;;; Commentary:
 
-;; This spot of code runs the sqlite3 program to .dump a database file as
+;; This spot of code runs the sqlite3 program to ".dump" a database file as
 ;; SQL text for viewing and editing.  Use `sqlite-dump' in `auto-mode-alist'
 ;; to automatically visit desired files this way.
 ;;
-;; The `buffer-file-format' mechanism is used with a dump for decode and
+;; The `buffer-file-format' mechanism is used to decode with a dump and
 ;; running the SQL to re-write.  See the `sqlite-dump' docstring for
 ;; details.
 
@@ -38,8 +38,8 @@
 ;;
 ;;     (autoload 'sqlite-dump "sqlite-dump" nil t)
 ;;
-;; To have it automatically on for instance .sqlite files (as used by
-;; various mozilla family browsers) then add
+;; To have it automatically on for instance .sqlite files (as per various
+;; mozilla family browsers) then add
 ;;
 ;;     (modify-coding-system-alist 'file "\\.sqlite\\'" 'raw-text-unix)
 ;;     (add-to-list 'auto-mode-alist '("\\.sqlite\\'" . sqlite-dump))
@@ -56,10 +56,15 @@
 ;; Version 3 - undo defadvice on unload-feature
 ;; Version 4 - better write-region-post-annotation-function
 ;; Version 5 - express dependency on 'advice
+;; Version 6 - emacs21 fix for defadvice after unload-feature
+;;           - compatibility setups for emacs20
 
 ;;; Emacsen:
 
 ;; Designed for Emacs 21 up, works in XEmacs 21.
+;;
+;; Works in Emacs 20 if you've got either Gnus mm-util.el or APEL poe.el for
+;; make-temp-file.
 
 ;;; Code:
 
@@ -67,15 +72,34 @@
 ;; (don't unload 'advice before our -unload-function)
 (require 'advice)
 
+(eval-when-compile
+  (require 'cl)) ;; for `mapc' in emacs20, and `declare' in emacs21
+
 ;;-----------------------------------------------------------------------------
-;; xemacs incompatibilities
+;; compatibilities
+
+(cond ((or (eval-when-compile (fboundp 'make-temp-file))
+           (fboundp 'make-temp-file))
+       ;; emacs21 up, noticed at compile time or run time
+       (eval-and-compile
+         (defalias 'sqlite-dump--make-temp-file 'make-temp-file)))
+
+      ((locate-library "mm-util") ;; from gnus
+       ;; xemacs21
+       (autoload 'mm-make-temp-file "mm-util")
+       (defalias 'sqlite-dump--make-temp-file 'mm-make-temp-file))
+
+      ((locate-library "poe") ;; from APEL
+       ;; emacs20 with poe.el add-on
+       (require 'poe)
+       (defalias 'sqlite-dump--make-temp-file 'make-temp-file))
+
+      (t
+       ;; umm, dunno, hope the user can define it
+       (message "sqlite-dump-.el: don't know where to get `make-temp-file'")
+       (defalias 'sqlite-dump--make-temp-file 'make-temp-file)))
+
 (eval-and-compile
-  (defalias 'sqlite-dump--make-temp-file
-    (if (eval-when-compile (fboundp 'make-temp-file))
-        'make-temp-file   ;; emacs
-      ;; xemacs21
-      (autoload 'mm-make-temp-file "mm-util") ;; from gnus
-      'mm-make-temp-file))
   (defalias 'sqlite-dump--set-buffer-multibyte
     (if (eval-when-compile (fboundp 'set-buffer-multibyte))
         'set-buffer-multibyte  ;; emacs
@@ -89,6 +113,7 @@
   "Create a `tempfile' variable for use by the BODY forms.
 An `unwind-protect' ensures the file is removed no matter what
 BODY does."
+  (declare (debug t))  ;; emacs22,xemacs21, or 'cl
   `(let ((tempfile (sqlite-dump--make-temp-file "sqlite-dump-el-" nil)))
      (unwind-protect
          (progn ,@body)
@@ -98,6 +123,7 @@ BODY does."
   "Create a `tempdbfile' variable for use by the BODY forms.
 An `unwind-protect' ensures it and any associated \"-journal\"
 file is removed no matter what BODY does."
+  (declare (debug t))  ;; emacs22,xemacs21, or 'cl
   `(let* ((tempdir    (sqlite-dump--make-temp-file "sqlite-dump-el-" t))
           (tempdbfile (expand-file-name "tempdb" tempdir)))
      (message "tempdir %S" tempdir)
@@ -123,6 +149,7 @@ meaning any writes done by an encode function kill the buffer
 that the encode is supposed to be operating on, usually making it
 go on to mangle the contents of an unrelated buffer."
 
+  (declare (debug t))  ;; emacs22,xemacs21, or 'cl
   `(let* ((sqlite-dump--without-post-kill--bad
            (and (local-variable-p 'write-region-post-annotation-function
                                   (current-buffer))
@@ -203,14 +230,28 @@ This has a buffer-local value in the *sqlite-dump-errors* buffer.")
 
 (defadvice compilation-find-file (around sqlite-dump activate)
   "Use `sqlite-dump-originating-buffer' for sqlite errors."
-  (if (and sqlite-dump-originating-buffer
-           (member filename '("### sqlite-dump-encode input:"
-                              "*unknown*" ;; emacs23
-                              "Error: near line "))) ;; xemacs21 hack
+  ;; args: (compilation-find-file MARKER FILENAME DIRECTORY &rest FORMATS)
+
+  ;; emacs21 `unload-feature' doesn't run `sqlite-dump-unload-function' so
+  ;; this defadvice remains.  `unload-feature' makes
+  ;; `sqlite-dump-originating-buffer' unbound in the buffer the unload was
+  ;; run from, hence check boundp to defang this code when everything else
+  ;; unloaded.  (`make-variable-buffer-local' means it's still locally bound
+  ;; in other buffers, and in new buffers, but probably shouldn't depend on
+  ;; that after unload.)
+  ;;
+  (if (and (boundp 'sqlite-dump-originating-buffer) ;; in case unloaded
+           sqlite-dump-originating-buffer
+           (member (ad-get-arg 1) ;; FILENAME
+                   '("### sqlite-dump-encode input:"
+                     "*unknown*" ;; emacs23
+                     "Error: near line "))) ;; xemacs21 hack
       (setq ad-return-value sqlite-dump-originating-buffer)
     ad-do-it))
 
 (defun sqlite-dump-unload-function ()
+  "Remove defadvice from `compilation-find-file'.
+This is called by `unload-feature'."
   (when (ad-find-advice 'compilation-find-file 'around 'sqlite-dump)
     (ad-remove-advice   'compilation-find-file 'around 'sqlite-dump)
     (ad-activate        'compilation-find-file))
@@ -236,24 +277,29 @@ This has a buffer-local value in the *sqlite-dump-errors* buffer.")
                              nil)) ;; write removes from buffer-file-formats
 
 (defun sqlite2-dump-decode (beg end)
+  ;; checkdoc-params: (beg end)
   "Run sqlite .dump on raw database bytes in the buffer.
 This function is for use from `format-alist'."
   (sqlite-dump-decode "sqlite" 'iso-8859-1 beg end))
 (defun sqlite3-dump-decode (beg end)
+  ;; checkdoc-params: (beg end)
   "Run sqlite3 .dump on raw database bytes in the buffer.
 This function is for use from `format-alist'."
   (sqlite-dump-decode "sqlite3" 'utf-8 beg end))
 
 (defun sqlite2-dump-encode (beg end buffer)
+  ;; checkdoc-params: (beg end buffer)
   "Run sqlite on SQL statements in the current buffer.
 This function is for use from `format-alist'."
   (sqlite-dump-encode "sqlite" 'iso-8859-1 beg end buffer))
 (defun sqlite3-dump-encode (beg end buffer)
+  ;; checkdoc-params: (beg end buffer)
   "Run sqlite3 on SQL statements in the current buffer.
 This function is for use from `format-alist'."
   (sqlite-dump-encode "sqlite3" 'utf-8 beg end buffer))
 
 (defun sqlite-dump-decode (program coding beg end)
+  ;; checkdoc-params: (program coding beg end)
   "Run PROGRAM .dump on raw database bytes in the buffer.
 The buffer should normally be unibyte as per a `raw-text-unix'
 read, but anything that writes out unchanged is acceptable.  The
@@ -292,6 +338,7 @@ if sqlite3 can't be run or the database contents are invalid."
         (point-max)))))
 
 (defun sqlite-dump-encode (program coding beg end buffer)
+  ;; checkdoc-params: (program coding beg end buffer)
   "Run sqlite3 on SQL statements in the current buffer.
 The buffer text is put through PROGRAM to create a new database
 file and its bytes replaces the text, switched to unibyte."
@@ -347,15 +394,18 @@ file and its bytes replaces the text, switched to unibyte."
               (compilation-mode)
               (setq sqlite-dump-originating-buffer buffer)
 
-              (error "sqlite encode error, see *sqlite-dump-errors* buffer")))))))))
+              (error "Sqlite encode error, see *sqlite-dump-errors* buffer")))))))))
 
 
 ;;-----------------------------------------------------------------------------
 
 (defconst sqlite2-dump-regexp
-  "\\*\\* This file contains an SQLite 2\\.1 database \\*\\*\000")
+  "\\*\\* This file contains an SQLite 2\\.1 database \\*\\*\000"
+  "Regexp for the start of an SQLite 2.x format database file.
+\(Actually it matches version number 2.1.  Was there a 2.0 too?)")
 (defconst sqlite3-dump-regexp
-  "SQLite format 3\000")
+  "SQLite format 3\000"
+  "Regexp for the start of an SQLite 3.x format database file.")
 
 ;;;###autoload
 (defun sqlite-dump ()
@@ -369,28 +419,32 @@ The SQL is formed by either
 
 The transform uses the `buffer-file-format' mechanism so you can
 edit the SQL and save to re-write the database.  A save replaces
-the entire file which means it's not safe if programs are
-currently accessing it.
+the entire file and is not safe if other programs are currently
+accessing it.
 
-Note that .dump tends to be quite forgiving of truncated or
+Note that \".dump\" tends to be quite forgiving of truncated or
 corrupt database files.  This is good for viewing, but doesn't
-tell you if some data loss may be occurring.
+tell you if some data loss might be occurring.
 
 --------
-For SQLite 3, the dump is utf-8 and is encoded/decoded as such
-\(except in an old Emacs without utf-8).  It's possible to have
-invalid encodings in a database, such as a binary BLOB without
-the right flags set, so check that before blaming the dump for a
-bad display.
+For SQLite 3, the dump is utf-8 and is encoded/decoded
+accordingly \(except in old Emacs without utf-8).  It's possible
+to have invalid encodings in a database, for instance a binary
+BLOB without blob type set on the field, so check that before
+blaming the dump for a bad display.
 
-The dump includes \"PRAGMA foreign_keys=OFF\" to foreign key
-constraint checking.  This means the order of insert statements
-doesn't matter, but also means any edits you make are not
-checked, so be careful.  Of course the database might already
-have violations, since constraint enforcement is only optional.
-Key constraints off allows such a database to be saved.
+The dump includes
 
-As of SQLite 3.6.21 the dump doesn't include a pragma to preserve
+    PRAGMA foreign_keys=OFF
+
+which disables foreign key constraint checking.  This means the
+order of insert statements for re-writing doesn't matter, but
+also means any edits you make are not checked, so be careful.  Of
+course the database might already have constraint violations,
+since their enforcement is only an option.  Having key
+constraints off allows such a database to be re-written.
+
+As of SQLite 3.7.4 the dump doesn't include a pragma to preserve
 the utf-16 flag in the database and you end up with a utf-8
 database on saving.  This makes no difference to actual
 operation, but may be undesirable if it was utf-16 to avoid
@@ -426,6 +480,8 @@ The sqlite-dump.el home page is
       (let ((inhibit-read-only t))
         (format-decode-buffer format))
       (sql-mode))))
+
+;; LocalWords: SQLite sqlite docstring unibyte latin pragma utf encodings runtime ascii superset
 
 (provide 'sqlite-dump)
 
